@@ -42,51 +42,6 @@
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
 
-#ifdef __linux /* Linux specific policy and affinity management */
-#include <sched.h>
-static inline void drop_policy(void)
-{
-	struct sched_param param;
-	param.sched_priority = 0;
-
-#ifdef SCHED_IDLE
-	if (unlikely(sched_setscheduler(0, SCHED_IDLE, &param) == -1))
-#endif
-#ifdef SCHED_BATCH
-		sched_setscheduler(0, SCHED_BATCH, &param);
-#endif
-}
-
-static inline void affine_to_cpu(int id, int cpu)
-{
-	cpu_set_t set;
-
-	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
-	sched_setaffinity(0, sizeof(set), &set);
-}
-#elif defined(__FreeBSD__) /* FreeBSD specific policy and affinity management */
-#include <sys/cpuset.h>
-static inline void drop_policy(void)
-{
-}
-
-static inline void affine_to_cpu(int id, int cpu)
-{
-	cpuset_t set;
-	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
-	cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(cpuset_t), &set);
-}
-#else
-static inline void drop_policy(void)
-{
-}
-
-static inline void affine_to_cpu(int id, int cpu)
-{
-}
-#endif
 		
 enum workio_commands {
 	WC_GET_WORK,
@@ -104,11 +59,15 @@ struct workio_cmd {
 enum algos {
 	ALGO_YESCRYPT,
 	ALGO_YESPOWER,
+	ALGO_YESCRYPTR8,
+	ALGO_YESPOWERR8,
 };
 
 static const char *algo_names[] = {
 	[ALGO_YESCRYPT]		= "yescrypt",
 	[ALGO_YESPOWER]		= "yespower",
+	[ALGO_YESCRYPTR8]		= "yescryptr8",
+	[ALGO_YESPOWERR8]		= "yespowerr8",
 };
 
 bool opt_debug = false;
@@ -132,6 +91,7 @@ static int opt_scantime = 5;
 static const bool opt_time = true;
 static enum algos opt_algo = ALGO_YESPOWER;
 static int opt_n_threads;
+int64_t opt_affinity = -1L;
 static int num_processors;
 static char *rpc_url;
 static char *rpc_userpass;
@@ -171,8 +131,9 @@ static char const usage[] = "\
 Usage: " PROGRAM_NAME " [OPTIONS]\n\
 Options:\n\
   -a, --algo=ALGO       specify the algorithm to use\n\
-                          yescrypt yescrypt\n\
-                          yespower yespower 0.5 (default)\n\
+                          yescrypt   yescrypt\n\
+                          yespower   yespower 0.5 (default)\n\
+                          (NOT implemented)yespowerr8 yespowerR8 0.5\n\
   -o, --url=URL         URL of mining server\n\
   -O, --userpass=U:P    username:password pair for mining server\n\
   -u, --user=USERNAME   username for mining server\n\
@@ -206,6 +167,7 @@ Options:\n\
   -B, --background      run the miner in the background\n"
 #endif
 "\
+      --cpu-affinity    set process affinity to cpu core(s), mask 0x3 for cores 0 and 1\n\
       --benchmark       run in offline benchmark mode\n\
   -c, --config=FILE     load a JSON-format configuration file\n\
   -V, --version         display version information and exit\n\
@@ -231,6 +193,7 @@ static struct option const options[] = {
 	{ "coinbase-addr", 1, NULL, 1013 },
 	{ "coinbase-sig", 1, NULL, 1015 },
 	{ "config", 1, NULL, 'c' },
+	{ "cpu-affinity", 1, NULL, 1020 },
 	{ "debug", 0, NULL, 'D' },
     { "hashdebug", 0, NULL, 'H' },
 	{ "help", 0, NULL, 'h' },
@@ -278,6 +241,54 @@ static time_t g_work_time;
 static pthread_mutex_t g_work_lock;
 static bool submit_old = false;
 static char *lp_id;
+
+#ifdef __linux /* Linux specific policy and affinity management */
+#include <sched.h>
+static inline void drop_policy(void)
+{
+	struct sched_param param;
+	param.sched_priority = 0;
+
+#ifdef SCHED_IDLE
+	if (unlikely(sched_setscheduler(0, SCHED_IDLE, &param) == -1))
+#endif
+#ifdef SCHED_BATCH
+		sched_setscheduler(0, SCHED_BATCH, &param);
+#endif
+}
+
+#ifdef __BIONIC__
+#define pthread_setaffinity_np(tid,sz,s) {} /* only do process affinity */
+#endif
+
+static void affine_to_cpu_mask(int id, unsigned long mask) {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	for (uint8_t i = 0; i < num_processors; i++) {
+		// cpu mask
+		if (mask & (1UL<<i)) { CPU_SET(i, &set); }
+	}
+	if (id == -1) {
+		// process affinity
+		sched_setaffinity(0, sizeof(&set), &set);
+	} else {
+		// thread only
+		pthread_setaffinity_np(thr_info[id].pth, sizeof(&set), &set);
+	}
+}
+
+#elif defined(WIN32) /* Windows */
+static inline void drop_policy(void) { }
+static void affine_to_cpu_mask(int id, unsigned long mask) {
+	if (id == -1)
+		SetProcessAffinityMask(GetCurrentProcess(), mask);
+	else
+		SetThreadAffinityMask(GetCurrentThread(), mask);
+}
+#else
+static inline void drop_policy(void) { }
+static void affine_to_cpu_mask(int id, unsigned long mask) { }
+#endif
 
 static inline void work_free(struct work *w)
 {
@@ -362,6 +373,7 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 	uint32_t final_sapling_hash[8];
 	bool coinbase_append = false;
 	bool submit_coinbase = false;
+	bool segwit = false;
 	bool version_force = false;
 	bool version_reduce = false;
 	json_t *tmp, *txa;
@@ -491,13 +503,47 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		cbtx[41] = cbtx_size - 42; /* scriptsig length */
 		le32enc((uint32_t *)(cbtx+cbtx_size), 0xffffffff); /* sequence */
 		cbtx_size += 4;
-		cbtx[cbtx_size++] = 1; /* out-counter */
+		cbtx[cbtx_size++] = segwit ? 2 : 1; /* out-counter */
 		le32enc((uint32_t *)(cbtx+cbtx_size), (uint32_t)cbvalue); /* value */
 		le32enc((uint32_t *)(cbtx+cbtx_size+4), cbvalue >> 32);
 		cbtx_size += 8;
 		cbtx[cbtx_size++] = pk_script_size; /* txout-script length */
 		memcpy(cbtx+cbtx_size, pk_script, pk_script_size);
 		cbtx_size += pk_script_size;
+		if (segwit) {
+			unsigned char (*wtree)[32] = calloc(tx_count + 2, 32);
+			memset(cbtx+cbtx_size, 0, 8); /* value */
+			cbtx_size += 8;
+			cbtx[cbtx_size++] = 38; /* txout-script length */
+			cbtx[cbtx_size++] = 0x6a; /* txout-script */
+			cbtx[cbtx_size++] = 0x24;
+			cbtx[cbtx_size++] = 0xaa;
+			cbtx[cbtx_size++] = 0x21;
+			cbtx[cbtx_size++] = 0xa9;
+			cbtx[cbtx_size++] = 0xed;
+			for (i = 0; i < tx_count; i++) {
+				const json_t *tx = json_array_get(txa, i);
+				const json_t *hash = json_object_get(tx, "hash");
+				if (!hash || !hex2bin(wtree[1+i], json_string_value(hash), 32)) {
+					applog(LOG_ERR, "JSON invalid transaction hash");
+					free(wtree);
+					goto out;
+				}
+				memrev(wtree[1+i], 32);
+			}
+			n = tx_count + 1;
+			while (n > 1) {
+				if (n % 2)
+					memcpy(wtree[n], wtree[n-1], 32);
+				n = (n + 1) / 2;
+				for (i = 0; i < n; i++)
+					sha256d(wtree[i], wtree[2*i], 64);
+			}
+			memset(wtree[1], 0, 32);  /* witness reserved value = 0 */
+			sha256d(cbtx+cbtx_size, wtree[0], 64);
+			cbtx_size += 32;
+			free(wtree);
+		}
 		le32enc((uint32_t *)(cbtx+cbtx_size), 0); /* lock time */
 		cbtx_size += 4;
 		coinbase_append = true;
@@ -560,14 +606,23 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		tmp = json_array_get(txa, i);
 		const char *tx_hex = json_string_value(json_object_get(tmp, "data"));
 		const int tx_size = tx_hex ? strlen(tx_hex) / 2 : 0;
-		unsigned char *tx = malloc(tx_size);
-		if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
-			applog(LOG_ERR, "JSON invalid transactions");
+		if (segwit) {
+			const char *txid = json_string_value(json_object_get(tmp, "txid"));
+			if (!txid || !hex2bin(merkle_tree[1 + i], txid, 32)) {
+				applog(LOG_ERR, "JSON invalid transaction txid");
+				goto out;
+			}
+			memrev(merkle_tree[1 + i], 32);
+		} else {
+			unsigned char *tx = malloc(tx_size);
+			if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
+				applog(LOG_ERR, "JSON invalid transactions");
+				free(tx);
+				goto out;
+			}
+			sha256d(merkle_tree[1 + i], tx, tx_size);
 			free(tx);
-			goto out;
 		}
-		sha256d(merkle_tree[1 + i], tx, tx_size);
-		free(tx);
 		if (!submit_coinbase)
 			strcat(work->txs, tx_hex);
 	}
@@ -657,9 +712,9 @@ static void share_result(int result, const char *reason)
 		hashrate += thr_hashrates[i];
 	result ? accepted_count++ : rejected_count++;
 	pthread_mutex_unlock(&stats_lock);
-	
-	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s khash/s %s",
+
+	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.4f", 1e-3 * hashrate);
+	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s kH/s %s",
 		   accepted_count,
 		   accepted_count + rejected_count,
 		   100. * accepted_count / (accepted_count + rejected_count),
@@ -701,19 +756,22 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 	if (have_stratum) {
 		uint32_t ntime, nonce;
-		char ntimestr[9], noncestr[9], *xnonce2str;
+		char ntimestr[9], noncestr[9], *xnonce2str, *req;
 
 		le32enc(&ntime, work->data[17]);
 		le32enc(&nonce, work->data[19]);
 		bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
 		bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
 		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-		sprintf(s,
+		req = malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 2 * work->xnonce2_len);
+		sprintf(req,
 			"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
 			rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
 		free(xnonce2str);
 
-		if (unlikely(!stratum_send_line(&stratum, s))) {
+		rc = stratum_send_line(&stratum, req);
+		free(req);
+		if (unlikely(!rc)) {
 			applog(LOG_ERR, "submit_upstream_work stratum_send_line failed");
 			goto out;
 		}
@@ -805,13 +863,14 @@ static const char *getwork_req =
 	"{\"method\": \"getwork\", \"params\": [], \"id\":0}\r\n";
 
 #define GBT_CAPABILITIES "[\"coinbasetxn\", \"coinbasevalue\", \"longpoll\", \"workid\"]"
+#define GBT_RULES "[\"segwit\"]"
 
 static const char *gbt_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
-	GBT_CAPABILITIES "}], \"id\":0}\r\n";
+	GBT_CAPABILITIES ", \"rules\": " GBT_RULES "}], \"id\":0}\r\n";
 static const char *gbt_lp_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
-	GBT_CAPABILITIES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
+	GBT_CAPABILITIES ", \"rules\": " GBT_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
 
 static bool get_upstream_work(CURL *curl, struct work *work)
 {
@@ -1107,6 +1166,8 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
 	if (opt_algo == ALGO_YESCRYPT || opt_algo == ALGO_YESPOWER)
 		diff_to_target(work->target, sctx->job.diff / 65536.0);
+	else if (opt_algo == ALGO_YESCRYPTR8 || opt_algo == ALGO_YESPOWERR8)
+		diff_to_target(work->target, sctx->job.diff / 65536.0);
 	else
 		diff_to_target(work->target, sctx->job.diff);
 }
@@ -1120,6 +1181,7 @@ static void *miner_thread(void *userdata)
 	struct work work = {{0}};
 	uint32_t max_nonce;
 	uint32_t end_nonce = 0xffffffffU / opt_n_threads * (thr_id + 1) - 0x20;
+	unsigned char *scratchbuf = NULL;
 	char s[16];
 	int i;
 
@@ -1131,14 +1193,29 @@ static void *miner_thread(void *userdata)
 		drop_policy();
 	}
 
+	/* Cpu thread affinity */
+	if (num_processors > 1) {
+		if (opt_affinity == -1 && opt_n_threads > 1) {
+			if (opt_debug)
+				applog(LOG_DEBUG, "Binding thread %d to cpu %d (mask %x)", thr_id,
+						thr_id % num_processors, (1 << (thr_id % num_processors)));
+			affine_to_cpu_mask(thr_id, 1UL << (thr_id % num_processors));
+		} else if (opt_affinity != -1L) {
+			if (opt_debug)
+				applog(LOG_DEBUG, "Binding thread %d to cpu mask %x", thr_id,
+						opt_affinity);
+			affine_to_cpu_mask(thr_id, (unsigned long)opt_affinity);
+		}
+	}
+
 	/* Cpu affinity only makes sense if the number of threads is a multiple
 	 * of the number of CPUs */
-	if (num_processors > 1 && opt_n_threads % num_processors == 0) {
-		if (!opt_quiet)
-			applog(LOG_INFO, "Binding thread %d to cpu %d",
-			       thr_id, thr_id % num_processors);
-		affine_to_cpu(thr_id, thr_id % num_processors);
-	}
+	// if (num_processors > 1 && opt_n_threads % num_processors == 0) {
+	// 	if (!opt_quiet)
+	// 		applog(LOG_INFO, "Binding thread %d to cpu %d",
+	// 		       thr_id, thr_id % num_processors);
+	// 	affine_to_cpu(thr_id, thr_id % num_processors);
+	// }
 	
 	while (1) {
 		unsigned long hashes_done;
@@ -1195,6 +1272,11 @@ static void *miner_thread(void *userdata)
 			case ALGO_YESCRYPT:
 			case ALGO_YESPOWER:
 				max64 = 0xfff;
+			case ALGO_YESCRYPTR8:
+				max64 = 0x000fff;
+				break;
+			case ALGO_YESPOWERR8:
+				max64 = 0x000fff;
 				break;
 			}
 		}
@@ -1215,6 +1297,11 @@ static void *miner_thread(void *userdata)
 			rc = scanhash_yespower(thr_id, work.data, work.target,
 			                      max_nonce, &hashes_done, perslen);
 			break;
+		case ALGO_YESCRYPTR8:
+		case ALGO_YESPOWERR8:
+			rc = scanhash_yespower(thr_id, work.data, work.target,
+					       max_nonce, &hashes_done,perslen);
+			break;
 		default:
 			/* should never happen */
 			goto out;
@@ -1230,9 +1317,9 @@ static void *miner_thread(void *userdata)
 			pthread_mutex_unlock(&stats_lock);
 		}
 		if (!opt_quiet) {
-			sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.2f",
+			sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.4f",
 				1e-3 * thr_hashrates[thr_id]);
-			applog(LOG_INFO, "thread %d: %lu hashes, %s khash/s",
+			applog(LOG_INFO, "thread %d: %lu hashes, %s kH/s",
 				thr_id, hashes_done, s);
 		}
 		if (opt_benchmark && thr_id == opt_n_threads - 1) {
@@ -1240,8 +1327,8 @@ static void *miner_thread(void *userdata)
 			for (i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
 				hashrate += thr_hashrates[i];
 			if (i == opt_n_threads) {
-				sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
-				applog(LOG_INFO, "Total: %s khash/s", s);
+				sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.4f", 1e-3 * hashrate);
+				applog(LOG_INFO, "Total: %s kH/s", s);
 			}
 		}
 
@@ -1528,6 +1615,7 @@ static void parse_arg(int key, char *arg, char *pname)
 {
 	char *p;
 	int v, i;
+	uint64_t ul;
 
 	switch(key) {
 	case 'a':
@@ -1739,6 +1827,16 @@ static void parse_arg(int key, char *arg, char *pname)
 		}
 		strcpy(coinbase_sig, arg);
 		break;
+	case 1020:
+		p = strstr(arg, "0x");
+		if (p)
+			ul = strtoul(p, NULL, 16);
+		else
+			ul = atol(arg);
+		if (ul > (1UL<<num_processors)-1)
+			ul = -1;
+		opt_affinity = ul;
+		break;
 	case 'S':
 		use_syslog = true;
 		break;
@@ -1827,17 +1925,48 @@ static void signal_handler(int sig)
 }
 #endif
 
+static void show_credits()
+{
+	printf("** " PACKAGE_NAME " " PACKAGE_VERSION " by fi0afarson@github **\n");
+//	printf("** yespowerR8 0.5 support by cryptozeny@github **\n");
+	printf("** yespower   0.5 support by KotoDevelopers@github **\n");
+	printf("\n");
+}
+
 int main(int argc, char *argv[])
 {
 	struct thr_info *thr;
 	long flags;
 	int i;
 
+	show_credits();
+
 	rpc_user = strdup("");
 	rpc_pass = strdup("");
 
+#if defined(WIN32)
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	num_processors = sysinfo.dwNumberOfProcessors;
+#elif defined(_SC_NPROCESSORS_CONF)
+	num_processors = sysconf(_SC_NPROCESSORS_CONF);
+#elif defined(CTL_HW) && defined(HW_NCPU)
+	int req[] = { CTL_HW, HW_NCPU };
+	size_t len = sizeof(num_processors);
+	sysctl(req, 2, &num_processors, &len, NULL, 0);
+#else
+	num_processors = 1;
+#endif
+	if (num_processors < 1)
+		num_processors = 1;
+
 	/* parse command line */
 	parse_cmdline(argc, argv);
+
+	if (!opt_n_threads)
+		opt_n_threads = num_processors;
+	if (!opt_n_threads)
+		opt_n_threads = 1;
 
 	if (!opt_benchmark && !rpc_url) {
 		fprintf(stderr, "%s: no URL supplied\n", argv[0]);
@@ -1882,23 +2011,11 @@ int main(int argc, char *argv[])
 	}
 #endif
 
-#if defined(WIN32)
-	SYSTEM_INFO sysinfo;
-	GetSystemInfo(&sysinfo);
-	num_processors = sysinfo.dwNumberOfProcessors;
-#elif defined(_SC_NPROCESSORS_CONF)
-	num_processors = sysconf(_SC_NPROCESSORS_CONF);
-#elif defined(CTL_HW) && defined(HW_NCPU)
-	int req[] = { CTL_HW, HW_NCPU };
-	size_t len = sizeof(num_processors);
-	sysctl(req, 2, &num_processors, &len, NULL, 0);
-#else
-	num_processors = 1;
-#endif
-	if (num_processors < 1)
-		num_processors = 1;
-	if (!opt_n_threads)
-		opt_n_threads = num_processors;
+	if (opt_affinity != -1) {
+		if (!opt_quiet)
+			applog(LOG_DEBUG, "Binding process to cpu mask %x", opt_affinity);
+		affine_to_cpu_mask(-1, (unsigned long)opt_affinity);
+	}
 
 #ifdef HAVE_SYSLOG_H
 	if (use_syslog)

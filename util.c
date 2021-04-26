@@ -507,6 +507,16 @@ err_out:
 	return NULL;
 }
 
+void memrev(unsigned char *p, size_t len)
+{
+	unsigned char c, *q;
+	for (q = p + len - 1; p < q; p++, q--) {
+		c = *p;
+		*p = *q;
+		*q = c;
+	}
+}
+
 void bin2hex(char *s, const unsigned char *p, size_t len)
 {
 	int i;
